@@ -1,69 +1,77 @@
 package main
 
 import (
-	"context"
+	"net"
+	"sync"
 
+	chat "github.com/Kpatoc452/cli_messanger/gen"
 	pb "github.com/Kpatoc452/cli_messanger/gen"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 )
 
-type Connection struct {
-	pb.User
-	stream grpc.ServerStreamingServer[pb.MessageResponse]
-}
-
 type Server struct {
-	pb.UnimplementedChatServer
-	conns   map[int64]*Connection
-	msgChan chan *pb.MessageRequest
+	pb.UnimplementedChatServiceServer
+	mu      sync.Mutex
+	conns   map[pb.ChatService_ConnectServer]bool
+	msgChan chan *pb.Message
 }
 
 func NewServer() *Server {
 	return &Server{
-		conns:   make(map[int64]*Connection),
-		msgChan: make(chan *pb.MessageRequest),
+		conns:   make(map[pb.ChatService_ConnectServer]bool),
+		msgChan: make(chan *pb.Message),
 	}
 }
 
-func (s *Server) CreateConnect(req *pb.ConnectRequest, stream grpc.ServerStreamingServer[pb.MessageResponse]) error {
-	s.conns[req.User.Id] = &Connection{
-		*req.User,
-		stream,
+func (s *Server) Connect(stream pb.ChatService_ConnectServer) error {
+	s.mu.Lock()
+	s.conns[stream] = true
+	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		delete(s.conns, stream)
+		s.mu.Unlock()
+	}()
+
+	go func() {
+		for {
+			msg, err := stream.Recv()
+			if err != nil {
+				logrus.Error(err)
+				return
+			}
+
+			s.msgChan <- msg
+		}
+	}()
+
+	for msg := range s.msgChan {
+		s.mu.Lock()
+		for client := range s.conns {
+			if err := client.Send(msg); err != nil {
+				logrus.Error(err)
+				return err 
+			}
+		}
+		s.mu.Unlock()
 	}
+
 	return nil
 }
 
-func (s *Server) SendMsg(ctx context.Context, req *pb.MessageRequest) (*pb.None, error) {
-	s.msgChan <- req
-	return &pb.None{}, nil
-}
-
-func (s *Server) sendMsgs(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			logrus.Info("Sender Stopped by ctx")
-			return
-		case msgReq := <-s.msgChan:
-			for _, c := range s.conns {
-				msgResp := &pb.MessageResponse{
-					Id:        msgReq.Id,
-					User:      msgReq.User,
-					Text:      msgReq.Text,
-					Timestamp: msgReq.Timestamp,
-				}
-
-				err := c.stream.SendMsg(msgResp)
-				if err != nil {
-					logrus.Error(err)
-				}
-			}
-		}
+func main() {
+	lis, err := net.Listen("tcp", ":9000")
+	if err != nil { 
+		logrus.Fatal(err)
 	}
-}
 
-func (s *Server) Run(ctx context.Context) {
-	go s.sendMsgs(ctx)
-	logrus.Info("Starting messaging")
+	gsrv := grpc.NewServer()
+	chat.RegisterChatServiceServer(gsrv, NewServer())
+	err = gsrv.Serve(lis)
+	if err != nil {
+		logrus.Fatal(err)
+	}
+
 }
